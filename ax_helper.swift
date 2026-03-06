@@ -3,12 +3,28 @@ import ApplicationServices
 import Foundation
 
 final class BannerObserver {
-    private var observer: AXObserver?
-    private var observedWindows = Set<AXUIElement>()
+    private struct BannerSnapshot: Hashable {
+        let app: String
+        let title: String
+        let body: String
+    }
+
+    private var observers: [pid_t: AXObserver] = [:]
+    private var deliveredSnapshots: [BannerSnapshot: Date] = [:]
+    private var isPrimed = false
     private let processNames = ["UserNotificationCenter", "NotificationCenter"]
     private let ignoredLabels: Set<String> = [
         "Close", "关闭", "Options", "选项", "Reply", "回复", "View", "查看",
     ]
+    private let observedNotifications: [CFString] = [
+        kAXWindowCreatedNotification as CFString,
+        kAXMainWindowChangedNotification as CFString,
+        kAXFocusedWindowChangedNotification as CFString,
+        kAXFocusedUIElementChangedNotification as CFString,
+    ]
+    private let scanInterval: TimeInterval = 0.5
+    private let dedupeTTL: TimeInterval = 8
+    private let debugEnabled = CommandLine.arguments.contains("--debug")
 
     func run() {
         guard AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": false] as CFDictionary) else {
@@ -17,59 +33,79 @@ final class BannerObserver {
             exit(2)
         }
 
-        guard let runningApp = findBannerProcess() else {
+        let runningApps = findBannerProcesses()
+        guard !runningApps.isEmpty else {
             fputs("{\"type\":\"error\",\"message\":\"Notification center process not found\"}\n", stderr)
             fflush(stderr)
             exit(3)
         }
 
-        let pid = runningApp.processIdentifier
-        let appElement = AXUIElementCreateApplication(pid)
-
-        var createdObserver: AXObserver?
         let callback: AXObserverCallback = { _, _, _, refcon in
             guard let refcon else { return }
             let instance = Unmanaged<BannerObserver>.fromOpaque(refcon).takeUnretainedValue()
             instance.scheduleWindowScan()
         }
+        let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
 
-        let createResult = AXObserverCreate(pid, callback, &createdObserver)
-        guard createResult == .success, let createdObserver else {
-            fputs("{\"type\":\"error\",\"message\":\"AXObserverCreate failed: \(createResult.rawValue)\"}\n", stderr)
-            fflush(stderr)
+        var readyPids: [pid_t] = []
+        for runningApp in runningApps {
+            let pid = runningApp.processIdentifier
+            let appElement = AXUIElementCreateApplication(pid)
+
+            var createdObserver: AXObserver?
+            let createResult = AXObserverCreate(pid, callback, &createdObserver)
+            guard createResult == .success, let createdObserver else {
+                logError("AXObserverCreate failed: \(createResult.rawValue)")
+                continue
+            }
+
+            var added = 0
+            for notification in observedNotifications {
+                let addResult = AXObserverAddNotification(
+                    createdObserver,
+                    appElement,
+                    notification,
+                    refcon
+                )
+                if addResult == .success || addResult == .notificationAlreadyRegistered {
+                    added += 1
+                    debug("registered \(notification) for pid=\(pid)")
+                } else {
+                    debug("failed registering \(notification) for pid=\(pid), code=\(addResult.rawValue)")
+                }
+            }
+
+            if added > 0 {
+                observers[pid] = createdObserver
+                let source = AXObserverGetRunLoopSource(createdObserver)
+                CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .defaultMode)
+                readyPids.append(pid)
+            }
+        }
+
+        guard !readyPids.isEmpty else {
+            logError("No AX notifications could be registered")
             exit(4)
         }
 
-        self.observer = createdObserver
-        let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-        let addResult = AXObserverAddNotification(
-            createdObserver,
-            appElement,
-            kAXWindowCreatedNotification as CFString,
-            refcon
-        )
-
-        guard addResult == .success else {
-            fputs("{\"type\":\"error\",\"message\":\"AXObserverAddNotification failed: \(addResult.rawValue)\"}\n", stderr)
-            fflush(stderr)
-            exit(5)
+        Timer.scheduledTimer(withTimeInterval: scanInterval, repeats: true) { [weak self] _ in
+            self?.scanWindows()
         }
-
-        let source = AXObserverGetRunLoopSource(createdObserver)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .defaultMode)
         scheduleWindowScan()
-        printJSON(["type": "ready", "pid": pid])
+        printJSON(["type": "ready", "pids": readyPids])
         RunLoop.current.run()
     }
 
-    private func findBannerProcess() -> NSRunningApplication? {
+    private func findBannerProcesses() -> [NSRunningApplication] {
         let apps = NSWorkspace.shared.runningApplications
-        for expectedName in processNames {
-            if let match = apps.first(where: { ($0.localizedName ?? "").contains(expectedName) }) {
-                return match
+        var matches: [NSRunningApplication] = []
+        for app in apps {
+            let name = app.localizedName ?? ""
+            if processNames.contains(where: { name.contains($0) }) {
+                matches.append(app)
             }
         }
-        return nil
+        return matches
     }
 
     private func scheduleWindowScan() {
@@ -79,21 +115,50 @@ final class BannerObserver {
     }
 
     private func scanWindows() {
-        guard let runningApp = findBannerProcess() else { return }
-        let appElement = AXUIElementCreateApplication(runningApp.processIdentifier)
-        guard let windows = copyAttribute(appElement, attribute: kAXWindowsAttribute as CFString) as? [AXUIElement] else {
-            return
+        pruneDeliveredSnapshots()
+
+        let runningApps = findBannerProcesses()
+        guard !runningApps.isEmpty else { return }
+
+        for runningApp in runningApps {
+            let appElement = AXUIElementCreateApplication(runningApp.processIdentifier)
+            var candidates: [AXUIElement] = []
+
+            if let windows = copyAttribute(appElement, attribute: kAXWindowsAttribute as CFString) as? [AXUIElement] {
+                candidates.append(contentsOf: windows)
+            }
+            if let children = copyAttribute(appElement, attribute: kAXChildrenAttribute as CFString) as? [AXUIElement] {
+                candidates.append(contentsOf: children)
+            }
+
+            if debugEnabled {
+                debug("scan pid=\(runningApp.processIdentifier), candidates=\(candidates.count)")
+            }
+
+            for window in candidates {
+                guard let payload = parseBanner(window: window) else {
+                    continue
+                }
+                let snapshot = BannerSnapshot(
+                    app: payload["app"] as? String ?? "",
+                    title: payload["title"] as? String ?? "",
+                    body: payload["body"] as? String ?? ""
+                )
+                if deliveredSnapshots[snapshot] != nil {
+                    continue
+                }
+                deliveredSnapshots[snapshot] = Date()
+                if isPrimed {
+                    printJSON(payload)
+                } else {
+                    debug("priming snapshot=\(snapshot)")
+                }
+            }
         }
 
-        for window in windows {
-            if observedWindows.contains(window) {
-                continue
-            }
-            observedWindows.insert(window)
-            guard let payload = parseBanner(window: window) else {
-                continue
-            }
-            printJSON(payload)
+        if !isPrimed {
+            isPrimed = true
+            debug("initial snapshot finished")
         }
     }
 
@@ -101,6 +166,11 @@ final class BannerObserver {
         let rawTexts = extractTexts(from: window)
         let texts = rawTexts.filter { !ignoredLabels.contains($0) }
         guard !texts.isEmpty else { return nil }
+        guard texts.count <= 8 else { return nil }
+
+        if debugEnabled {
+            debug("window texts=\(texts)")
+        }
 
         return [
             "type": "notification",
@@ -157,6 +227,22 @@ final class BannerObserver {
             return
         }
         FileHandle.standardOutput.write((text + "\n").data(using: .utf8)!)
+    }
+
+    private func debug(_ message: String) {
+        guard debugEnabled else { return }
+        fputs("[ax_helper] \(message)\n", stderr)
+        fflush(stderr)
+    }
+
+    private func logError(_ message: String) {
+        fputs("{\"type\":\"error\",\"message\":\"\(message.replacingOccurrences(of: "\"", with: "\\\""))\"}\n", stderr)
+        fflush(stderr)
+    }
+
+    private func pruneDeliveredSnapshots() {
+        let now = Date()
+        deliveredSnapshots = deliveredSnapshots.filter { now.timeIntervalSince($0.value) < dedupeTTL }
     }
 }
 

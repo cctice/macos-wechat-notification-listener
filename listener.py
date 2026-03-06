@@ -155,10 +155,11 @@ class DBListener:
 class AXListener:
     """通过 Swift helper 监听通知横幅，避免 pyobjc/ctypes 崩溃。"""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, debug: bool = False):
         self.app_identifiers: list[str] = config.get("apps", [])
         self.actions = build_actions(config.get("actions", [{"type": "print"}]))
         self.allowed_names = self._build_allowed_names(self.app_identifiers)
+        self.debug = debug
 
     def _build_allowed_names(self, app_identifiers: list[str]) -> set[str]:
         if not app_identifiers:
@@ -183,8 +184,12 @@ class AXListener:
             stop_event.set()
             return
 
+        command = ["swift", str(AX_HELPER_PATH)]
+        if self.debug:
+            command.append("--debug")
+
         process = subprocess.Popen(
-            ["swift", str(AX_HELPER_PATH)],
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -225,7 +230,10 @@ class AXListener:
 
                 message_type = payload.get("type")
                 if message_type == "ready":
-                    logger.info("[AX 模式] helper 已就绪，PID=%s", payload.get("pid"))
+                    pid_info = payload.get("pid")
+                    if pid_info is None:
+                        pid_info = payload.get("pids")
+                    logger.info("[AX 模式] helper 已就绪，PID=%s", pid_info)
                     continue
                 if message_type == "error":
                     logger.error("[AX 模式] helper 错误: %s", payload.get("message"))
@@ -251,6 +259,8 @@ class AXListener:
                         logger.error("Action 异常: %s", e)
 
             process.wait(timeout=1)
+            if process.returncode not in (0, None) and not stop_event.is_set():
+                logger.error("[AX 模式] helper 异常退出，code=%s", process.returncode)
         except Exception as e:
             logger.error("[AX 模式] 运行异常: %s", e)
         finally:
@@ -326,7 +336,7 @@ def main():
     if mode == "db":
         DBListener(config, since_beginning=args.since_beginning).run(stop_event)
     else:
-        AXListener(config).run(stop_event)
+        AXListener(config, debug=args.debug).run(stop_event)
 
 
 if __name__ == "__main__":
