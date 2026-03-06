@@ -9,8 +9,18 @@ final class BannerObserver {
         let body: String
     }
 
+    private struct CandidateDebugSnapshot: Hashable {
+        let role: String
+        let subrole: String
+        let roleDescription: String
+        let rawTexts: [String]
+        let filteredTexts: [String]
+        let reason: String
+    }
+
     private var observers: [pid_t: AXObserver] = [:]
     private var deliveredSnapshots: [BannerSnapshot: Date] = [:]
+    private var recentRejects: [CandidateDebugSnapshot: Date] = [:]
     private var isPrimed = false
     private let processNames = ["UserNotificationCenter", "NotificationCenter"]
     private let ignoredLabels: Set<String> = [
@@ -25,6 +35,8 @@ final class BannerObserver {
     private let scanInterval: TimeInterval = 0.5
     private let dedupeTTL: TimeInterval = 8
     private let debugEnabled = CommandLine.arguments.contains("--debug")
+    private let maxTextCount = 20
+    private let maxTextLength = 300
 
     func run() {
         guard AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": false] as CFDictionary) else {
@@ -116,6 +128,7 @@ final class BannerObserver {
 
     private func scanWindows() {
         pruneDeliveredSnapshots()
+        pruneRejects()
 
         let runningApps = findBannerProcesses()
         guard !runningApps.isEmpty else { return }
@@ -136,7 +149,7 @@ final class BannerObserver {
             }
 
             for window in candidates {
-                guard let payload = parseBanner(window: window) else {
+                guard let payload = parseBanner(window: window, pid: runningApp.processIdentifier) else {
                     continue
                 }
                 let snapshot = BannerSnapshot(
@@ -162,14 +175,52 @@ final class BannerObserver {
         }
     }
 
-    private func parseBanner(window: AXUIElement) -> [String: Any]? {
+    private func parseBanner(window: AXUIElement, pid: pid_t) -> [String: Any]? {
+        let role = (copyAttribute(window, attribute: kAXRoleAttribute as CFString) as? String) ?? ""
+        let subrole = (copyAttribute(window, attribute: kAXSubroleAttribute as CFString) as? String) ?? ""
+        let roleDescription = (copyAttribute(window, attribute: kAXRoleDescriptionAttribute as CFString) as? String) ?? ""
         let rawTexts = extractTexts(from: window)
+        if rawTexts.isEmpty {
+            emitReject(
+                pid: pid,
+                role: role,
+                subrole: subrole,
+                roleDescription: roleDescription,
+                rawTexts: rawTexts,
+                filteredTexts: [],
+                reason: "no_raw_texts"
+            )
+            return nil
+        }
+
         let texts = rawTexts.filter { !ignoredLabels.contains($0) }
-        guard !texts.isEmpty else { return nil }
-        guard texts.count <= 8 else { return nil }
+        if texts.isEmpty {
+            emitReject(
+                pid: pid,
+                role: role,
+                subrole: subrole,
+                roleDescription: roleDescription,
+                rawTexts: rawTexts,
+                filteredTexts: texts,
+                reason: "all_texts_filtered"
+            )
+            return nil
+        }
+        if texts.count > maxTextCount {
+            emitReject(
+                pid: pid,
+                role: role,
+                subrole: subrole,
+                roleDescription: roleDescription,
+                rawTexts: rawTexts,
+                filteredTexts: texts,
+                reason: "too_many_texts"
+            )
+            return nil
+        }
 
         if debugEnabled {
-            debug("window texts=\(texts)")
+            debug("window accepted pid=\(pid) role=\(role) subrole=\(subrole) desc=\(roleDescription) texts=\(texts)")
         }
 
         return [
@@ -182,7 +233,7 @@ final class BannerObserver {
     }
 
     private func extractTexts(from element: AXUIElement, depth: Int = 0, seen: inout Set<String>) -> [String] {
-        if depth > 6 {
+        if depth > 10 {
             return []
         }
 
@@ -190,10 +241,18 @@ final class BannerObserver {
         for attribute in [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute] {
             if let text = copyAttribute(element, attribute: attribute as CFString) as? String {
                 let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty && trimmed.count < 300 && !seen.contains(trimmed) {
+                if !trimmed.isEmpty && trimmed.count < maxTextLength && !seen.contains(trimmed) {
                     seen.insert(trimmed)
                     values.append(trimmed)
                 }
+            }
+        }
+
+        if let help = copyAttribute(element, attribute: kAXHelpAttribute as CFString) as? String {
+            let trimmed = help.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty && trimmed.count < maxTextLength && !seen.contains(trimmed) {
+                seen.insert(trimmed)
+                values.append(trimmed)
             }
         }
 
@@ -243,6 +302,36 @@ final class BannerObserver {
     private func pruneDeliveredSnapshots() {
         let now = Date()
         deliveredSnapshots = deliveredSnapshots.filter { now.timeIntervalSince($0.value) < dedupeTTL }
+    }
+
+    private func pruneRejects() {
+        let now = Date()
+        recentRejects = recentRejects.filter { now.timeIntervalSince($0.value) < dedupeTTL }
+    }
+
+    private func emitReject(
+        pid: pid_t,
+        role: String,
+        subrole: String,
+        roleDescription: String,
+        rawTexts: [String],
+        filteredTexts: [String],
+        reason: String
+    ) {
+        guard debugEnabled else { return }
+        let snapshot = CandidateDebugSnapshot(
+            role: role,
+            subrole: subrole,
+            roleDescription: roleDescription,
+            rawTexts: rawTexts,
+            filteredTexts: filteredTexts,
+            reason: reason
+        )
+        guard recentRejects[snapshot] == nil else { return }
+        recentRejects[snapshot] = Date()
+        debug(
+            "window rejected pid=\(pid) reason=\(reason) role=\(role) subrole=\(subrole) desc=\(roleDescription) raw=\(rawTexts) filtered=\(filteredTexts)"
+        )
     }
 }
 
