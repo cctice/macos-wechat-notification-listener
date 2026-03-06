@@ -2,18 +2,16 @@
 
 监听 macOS 微信（及其他 App）的系统通知，有新通知时自动触发动作。
 
-## 原理
+## 原理 & 兼容性
 
-macOS 将所有通知持久化存储在 SQLite 数据库：
+本工具自动选择两种方案：
 
-```
-~/Library/Group Containers/group.com.apple.usernoted/db2/db
-```
+| macOS 版本 | 方案 | 原理 |
+|---|---|---|
+| ≤ 26.2 | **DB 模式**（默认） | FSEvents 监听通知数据库 WAL 文件，增量读取 SQLite |
+| 26.3+ | **Accessibility 模式** | AXObserver 监听 `UserNotificationCenter` 窗口创建事件 |
 
-本工具通过 **macOS FSEvents** 监听数据库的 WAL 文件（`db-wal`）变化：
-- 进程平时处于睡眠状态，**零 CPU / 零轮询**
-- 系统一写入新通知 → FSEvents 立刻唤醒 → 读取增量 → 推给 Agent
-- 无需系统级权限或内核扩展
+两种方案均为**纯事件驱动**，进程平时处于睡眠状态，零 CPU / 零轮询。
 
 ## 快速开始
 
@@ -21,23 +19,24 @@ macOS 将所有通知持久化存储在 SQLite 数据库：
 # 安装依赖
 pip3 install -r requirements.txt
 
-# 使用默认配置启动（监听微信，打印到终端）
+# 启动（自动检测使用哪种方案）
 python3 listener.py
 
-# 指定配置文件
+# 强制指定方案
+python3 listener.py --mode db   # 数据库方案
+python3 listener.py --mode ax   # Accessibility 方案（macOS 26.3+）
+
+# 其他选项
 python3 listener.py --config my_config.yaml
-
-# 从历史起点处理所有已存在的通知
-python3 listener.py --since-beginning
-
-# 调试模式
+python3 listener.py --since-beginning   # 从头处理历史通知（仅 db 模式）
 python3 listener.py --debug
 ```
 
 ## 前提条件
 
 1. **开启微信通知权限**：系统设置 → 通知 → 微信 → 允许通知
-2. **Python 3.10+**（使用了 `match`/`|` 类型语法）
+2. **macOS 26.3+ 需额外授权**：系统设置 → 隐私与安全性 → 辅助功能 → 开启终端（或 Python）
+3. **Python 3.10+**
 
 ## 配置说明（config.yaml）
 
@@ -101,12 +100,13 @@ actions:
 
 ```
 .
-├── listener.py          # 主入口，守护进程
-├── notification_db.py   # 通知数据库读取/解析
-├── actions.py           # Action 处理器（print/webhook/shell）
-├── config.yaml          # 用户配置
-├── requirements.txt     # Python 依赖
-└── .listener_state.json # 运行时状态（自动生成，记录断点）
+├── listener.py             # 主入口，自动选择方案
+├── notification_db.py      # 通知数据库读取/解析（DB 模式）
+├── accessibility_watcher.py # AXObserver 监听器（macOS 26.3+ 模式）
+├── actions.py              # Action 处理器（print/webhook/shell）
+├── config.yaml             # 用户配置
+├── requirements.txt        # Python 依赖
+└── .listener_state.json    # 运行时状态（自动生成，记录断点）
 ```
 
 ## 注意事项
