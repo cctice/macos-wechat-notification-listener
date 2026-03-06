@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import CoreGraphics
 import Foundation
 
 final class BannerObserver {
@@ -40,6 +41,10 @@ final class BannerObserver {
     private let maxTextLength = 300
     private let maxTraversalDepth = 8
     private let traversableAttributes = [
+        "AXFocusedUIElement" as CFString,
+        "AXFocusedWindow" as CFString,
+        "AXMainWindow" as CFString,
+        "AXChildrenInNavigationOrder" as CFString,
         kAXChildrenAttribute as CFString,
         kAXVisibleChildrenAttribute as CFString,
         kAXContentsAttribute as CFString,
@@ -156,6 +161,7 @@ final class BannerObserver {
             if debugEnabled && !loggedAttributeNamesForPID.contains(runningApp.processIdentifier) {
                 loggedAttributeNamesForPID.insert(runningApp.processIdentifier)
                 debug("app pid=\(runningApp.processIdentifier) attrs=\(copyAttributeNames(appElement))")
+                debug("cg windows pid=\(runningApp.processIdentifier) info=\(copyWindowServerInfo(pid: runningApp.processIdentifier))")
             }
 
             var visited = Set<Int>()
@@ -373,6 +379,24 @@ final class BannerObserver {
             return []
         }
         return namesCF as? [String] ?? []
+    }
+
+    private func copyWindowServerInfo(pid: pid_t) -> [[String: Any]] {
+        guard let infoList = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+            return []
+        }
+        return infoList.compactMap { info in
+            guard let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t, ownerPID == pid else {
+                return nil
+            }
+            return [
+                "owner": info[kCGWindowOwnerName as String] as? String ?? "",
+                "name": info[kCGWindowName as String] as? String ?? "",
+                "layer": info[kCGWindowLayer as String] as? Int ?? -1,
+                "alpha": info[kCGWindowAlpha as String] as? Double ?? -1,
+                "bounds": info[kCGWindowBounds as String] as? [String: Any] ?? [:],
+            ]
+        }
     }
 
     private func unwrapAXElements(_ value: AnyObject) -> [AXUIElement] {
