@@ -9,7 +9,7 @@
 | macOS 版本 | 方案 | 原理 |
 |---|---|---|
 | ≤ 26.2 | **DB 模式**（默认） | FSEvents 监听通知数据库 WAL 文件，增量读取 SQLite |
-| 26.3+ | **Accessibility 模式** | AXObserver 监听 `UserNotificationCenter` 窗口创建事件 |
+| 26.3+ | **AX 模式** | 原生 Swift helper 用 `AXObserver` 监听 `UserNotificationCenter` 窗口创建事件 |
 
 两种方案均为**纯事件驱动**，进程平时处于睡眠状态，零 CPU / 零轮询。
 
@@ -35,8 +35,9 @@ python3 listener.py --debug
 ## 前提条件
 
 1. **开启微信通知权限**：系统设置 → 通知 → 微信 → 允许通知
-2. **macOS 26.3+ 需额外授权**：系统设置 → 隐私与安全性 → 辅助功能 → 开启终端（或 Python）
+2. **macOS 26.3+ 需额外授权**：系统设置 → 隐私与安全性 → 辅助功能 → 开启终端
 3. **Python 3.10+**
+4. **macOS 26.3+ 需安装 Swift 命令行工具**：系统自带即可，运行 `swift --version` 可验证
 
 ## 配置说明（config.yaml）
 
@@ -102,7 +103,7 @@ actions:
 .
 ├── listener.py             # 主入口，自动选择方案
 ├── notification_db.py      # 通知数据库读取/解析（DB 模式）
-├── accessibility_watcher.py # AXObserver 监听器（macOS 26.3+ 模式）
+├── ax_helper.swift          # 原生 AXObserver 监听器（macOS 26.3+ 模式）
 ├── actions.py              # Action 处理器（print/webhook/shell）
 ├── config.yaml             # 用户配置
 ├── requirements.txt        # Python 依赖
@@ -111,6 +112,7 @@ actions:
 
 ## 注意事项
 
-- 通知数据库使用 WAL 模式，以只读方式打开不会影响系统稳定性
+- DB 模式使用 WAL 文件事件监听，以只读方式打开不会影响系统稳定性
 - 进程重启后会从上次的 `rec_id` 继续（状态保存在 `.listener_state.json`）
 - 微信的通知内容可能因隐私设置而被截断（如显示"1条新消息"而非具体内容）
+- AX 模式不再依赖 `pyobjc + ctypes`，避免在 macOS 26.3 上触发 `SIGSEGV`
