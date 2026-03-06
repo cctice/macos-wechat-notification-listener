@@ -21,6 +21,7 @@ final class BannerObserver {
     private var observers: [pid_t: AXObserver] = [:]
     private var deliveredSnapshots: [BannerSnapshot: Date] = [:]
     private var recentRejects: [CandidateDebugSnapshot: Date] = [:]
+    private var loggedAttributeNamesForPID = Set<pid_t>()
     private var isPrimed = false
     private let processNames = ["UserNotificationCenter", "NotificationCenter"]
     private let ignoredLabels: Set<String> = [
@@ -37,6 +38,23 @@ final class BannerObserver {
     private let debugEnabled = CommandLine.arguments.contains("--debug")
     private let maxTextCount = 20
     private let maxTextLength = 300
+    private let maxTraversalDepth = 8
+    private let traversableAttributes = [
+        kAXChildrenAttribute as CFString,
+        kAXVisibleChildrenAttribute as CFString,
+        kAXContentsAttribute as CFString,
+        kAXWindowsAttribute as CFString,
+        kAXRowsAttribute as CFString,
+        kAXColumnsAttribute as CFString,
+        kAXToolbarButtonAttribute as CFString,
+        kAXServesAsTitleForUIElementsAttribute as CFString,
+    ]
+    private let ignoredRoles = Set([
+        kAXMenuBarRole as String,
+        kAXMenuRole as String,
+        kAXMenuItemRole as String,
+        kAXMenuBarItemRole as String,
+    ])
 
     func run() {
         guard AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": false] as CFDictionary) else {
@@ -135,23 +153,26 @@ final class BannerObserver {
 
         for runningApp in runningApps {
             let appElement = AXUIElementCreateApplication(runningApp.processIdentifier)
-            var candidates: [AXUIElement] = []
+            if debugEnabled && !loggedAttributeNamesForPID.contains(runningApp.processIdentifier) {
+                loggedAttributeNamesForPID.insert(runningApp.processIdentifier)
+                debug("app pid=\(runningApp.processIdentifier) attrs=\(copyAttributeNames(appElement))")
+            }
 
-            if let windows = copyAttribute(appElement, attribute: kAXWindowsAttribute as CFString) as? [AXUIElement] {
-                candidates.append(contentsOf: windows)
-            }
-            if let children = copyAttribute(appElement, attribute: kAXChildrenAttribute as CFString) as? [AXUIElement] {
-                candidates.append(contentsOf: children)
-            }
+            var visited = Set<Int>()
+            let candidates = collectCandidates(
+                from: appElement,
+                pid: runningApp.processIdentifier,
+                depth: 0,
+                path: "AXApplication",
+                visited: &visited
+            )
 
             if debugEnabled {
                 debug("scan pid=\(runningApp.processIdentifier), candidates=\(candidates.count)")
             }
 
-            for window in candidates {
-                guard let payload = parseBanner(window: window, pid: runningApp.processIdentifier) else {
-                    continue
-                }
+            for candidate in candidates {
+                let payload = candidate.payload
                 let snapshot = BannerSnapshot(
                     app: payload["app"] as? String ?? "",
                     title: payload["title"] as? String ?? "",
@@ -175,11 +196,74 @@ final class BannerObserver {
         }
     }
 
-    private func parseBanner(window: AXUIElement, pid: pid_t) -> [String: Any]? {
-        let role = (copyAttribute(window, attribute: kAXRoleAttribute as CFString) as? String) ?? ""
-        let subrole = (copyAttribute(window, attribute: kAXSubroleAttribute as CFString) as? String) ?? ""
-        let roleDescription = (copyAttribute(window, attribute: kAXRoleDescriptionAttribute as CFString) as? String) ?? ""
-        let rawTexts = extractTexts(from: window)
+    private struct CandidateResult {
+        let payload: [String: Any]
+        let path: String
+    }
+
+    private func collectCandidates(
+        from element: AXUIElement,
+        pid: pid_t,
+        depth: Int,
+        path: String,
+        visited: inout Set<Int>
+    ) -> [CandidateResult] {
+        if depth > maxTraversalDepth {
+            return []
+        }
+
+        let elementHash = Int(CFHash(element))
+        if visited.contains(elementHash) {
+            return []
+        }
+        visited.insert(elementHash)
+
+        var results: [CandidateResult] = []
+        if let payload = parseBanner(element: element, pid: pid, path: path) {
+            results.append(CandidateResult(payload: payload, path: path))
+        }
+
+        for attribute in traversableAttributes {
+            guard let attrValue = copyAttribute(element, attribute: attribute) else {
+                continue
+            }
+            let nextPathBase = "\(path).\(attribute)"
+            let childElements = unwrapAXElements(attrValue)
+            for (idx, child) in childElements.enumerated() {
+                let childPath = childElements.count == 1 ? nextPathBase : "\(nextPathBase)[\(idx)]"
+                results.append(
+                    contentsOf: collectCandidates(
+                        from: child,
+                        pid: pid,
+                        depth: depth + 1,
+                        path: childPath,
+                        visited: &visited
+                    )
+                )
+            }
+        }
+        return results
+    }
+
+    private func parseBanner(element: AXUIElement, pid: pid_t, path: String) -> [String: Any]? {
+        let role = (copyAttribute(element, attribute: kAXRoleAttribute as CFString) as? String) ?? ""
+        let subrole = (copyAttribute(element, attribute: kAXSubroleAttribute as CFString) as? String) ?? ""
+        let roleDescription = (copyAttribute(element, attribute: kAXRoleDescriptionAttribute as CFString) as? String) ?? ""
+        if ignoredRoles.contains(role) {
+            emitReject(
+                pid: pid,
+                role: role,
+                subrole: subrole,
+                roleDescription: roleDescription,
+                rawTexts: [],
+                filteredTexts: [],
+                reason: "ignored_role",
+                path: path
+            )
+            return nil
+        }
+
+        let rawTexts = extractTexts(from: element)
         if rawTexts.isEmpty {
             emitReject(
                 pid: pid,
@@ -188,7 +272,8 @@ final class BannerObserver {
                 roleDescription: roleDescription,
                 rawTexts: rawTexts,
                 filteredTexts: [],
-                reason: "no_raw_texts"
+                reason: "no_raw_texts",
+                path: path
             )
             return nil
         }
@@ -202,7 +287,8 @@ final class BannerObserver {
                 roleDescription: roleDescription,
                 rawTexts: rawTexts,
                 filteredTexts: texts,
-                reason: "all_texts_filtered"
+                reason: "all_texts_filtered",
+                path: path
             )
             return nil
         }
@@ -214,13 +300,14 @@ final class BannerObserver {
                 roleDescription: roleDescription,
                 rawTexts: rawTexts,
                 filteredTexts: texts,
-                reason: "too_many_texts"
+                reason: "too_many_texts",
+                path: path
             )
             return nil
         }
 
         if debugEnabled {
-            debug("window accepted pid=\(pid) role=\(role) subrole=\(subrole) desc=\(roleDescription) texts=\(texts)")
+            debug("window accepted pid=\(pid) path=\(path) role=\(role) subrole=\(subrole) desc=\(roleDescription) texts=\(texts)")
         }
 
         return [
@@ -279,6 +366,30 @@ final class BannerObserver {
         return value
     }
 
+    private func copyAttributeNames(_ element: AXUIElement) -> [String] {
+        var namesCF: CFArray?
+        let error = AXUIElementCopyAttributeNames(element, &namesCF)
+        guard error == .success, let namesCF else {
+            return []
+        }
+        return namesCF as? [String] ?? []
+    }
+
+    private func unwrapAXElements(_ value: AnyObject) -> [AXUIElement] {
+        if CFGetTypeID(value) == AXUIElementGetTypeID() {
+            return [unsafeBitCast(value, to: AXUIElement.self)]
+        }
+        if let array = value as? [AnyObject] {
+            return array.compactMap { item in
+                guard CFGetTypeID(item) == AXUIElementGetTypeID() else {
+                    return nil
+                }
+                return unsafeBitCast(item, to: AXUIElement.self)
+            }
+        }
+        return []
+    }
+
     private func printJSON(_ payload: [String: Any]) {
         guard JSONSerialization.isValidJSONObject(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload),
@@ -316,7 +427,8 @@ final class BannerObserver {
         roleDescription: String,
         rawTexts: [String],
         filteredTexts: [String],
-        reason: String
+        reason: String,
+        path: String
     ) {
         guard debugEnabled else { return }
         let snapshot = CandidateDebugSnapshot(
@@ -325,12 +437,12 @@ final class BannerObserver {
             roleDescription: roleDescription,
             rawTexts: rawTexts,
             filteredTexts: filteredTexts,
-            reason: reason
+            reason: "\(reason)@\(path)"
         )
         guard recentRejects[snapshot] == nil else { return }
         recentRejects[snapshot] = Date()
         debug(
-            "window rejected pid=\(pid) reason=\(reason) role=\(role) subrole=\(subrole) desc=\(roleDescription) raw=\(rawTexts) filtered=\(filteredTexts)"
+            "window rejected pid=\(pid) path=\(path) reason=\(reason) role=\(role) subrole=\(subrole) desc=\(roleDescription) raw=\(rawTexts) filtered=\(filteredTexts)"
         )
     }
 }
