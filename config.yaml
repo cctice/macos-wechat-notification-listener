@@ -1,0 +1,44 @@
+# macOS 通知监听器配置
+
+# 轮询间隔（秒），推荐 2~5 秒
+polling_interval: 3
+
+# 监听的 App Bundle ID 列表
+# 留空（apps: []）则监听所有 App 的通知
+apps:
+  - com.tencent.xinwechat       # 微信
+  # - com.tencent.weworkmac     # 企业微信
+  # - com.electron.lark         # 飞书
+  # - com.tencent.qq            # QQ
+
+# 触发的动作列表（按顺序执行，可配置多个）
+actions:
+  # ── 打印到 stdout ──────────────────────────────────────────
+  - type: print
+    # 支持占位符：{notification} {app} {title} {body} {subtitle}
+    format: "[微信通知] {title} - {body}"
+
+  # ── HTTP Webhook ───────────────────────────────────────────
+  # - type: webhook
+  #   url: http://localhost:8080/webhook
+  #   method: POST
+  #   headers:
+  #     Content-Type: application/json
+  #     Authorization: Bearer YOUR_TOKEN
+  #   # 自定义请求体（留空则使用默认结构）
+  #   # payload_template:
+  #   #   event: wechat_notification
+  #   #   content: "{title}: {body}"
+  #   timeout: 10
+
+  # ── 执行 Shell 命令 ────────────────────────────────────────
+  # - type: shell
+  #   command: "echo '[{app}] {title}: {body}' >> /tmp/notifications.log"
+
+  # ── 发送给本地 Agent（示例） ────────────────────────────────
+  # - type: webhook
+  #   url: http://localhost:3000/agent/message
+  #   method: POST
+  #   payload_template:
+  #     role: user
+  #     content: "微信新消息 - 发件人: {title}，内容: {body}"
