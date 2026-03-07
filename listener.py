@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-macOS 微信通知监听器（事件驱动）
+macOS 微信通知监听器
 
 自动选择监听方案：
-  • DB 模式：FSEvents 监听通知数据库 WAL 文件
-  • AX 模式：原生 Swift helper 监听通知横幅，兼容 macOS 26.3+ 的数据库权限收紧
+  • DB 模式：轻量增量轮询通知数据库，按 rec_id 追踪新通知
+  • AX 模式：原生 Swift helper 监听通知横幅，兼容数据库不可用场景
 """
 
 import argparse
@@ -72,13 +72,12 @@ def can_access_notification_db() -> bool:
 
 
 class DBListener:
-    """通过监听通知数据库 WAL 文件变化获取新通知。"""
-
-    DEBOUNCE_SECS = 0.3
+    """通过轻量增量轮询通知数据库获取新通知。"""
 
     def __init__(self, config: dict, since_beginning: bool = False):
         self.app_identifiers: list[str] = config.get("apps", [])
         self.actions = build_actions(config.get("actions", [{"type": "print"}]))
+        self.polling_interval = float(config.get("polling_interval", 0.5))
 
         state = load_state()
         if since_beginning:
@@ -86,30 +85,26 @@ class DBListener:
         else:
             self.last_rec_id = state.get("last_rec_id", get_current_max_rec_id())
 
-        logger.info("[DB 模式] 从 rec_id=%d 开始监听", self.last_rec_id)
+        logger.info(
+            "[DB 模式] 从 rec_id=%d 开始监听，轮询间隔 %.1fs",
+            self.last_rec_id,
+            self.polling_interval,
+        )
 
     def run(self, stop_event: threading.Event) -> None:
-        from watchdog.events import FileSystemEventHandler
-        from watchdog.observers import Observer
-
-        db_dir = str(Path(NOTIFICATION_DB_PATH).parent)
-        db_wal = str(Path(NOTIFICATION_DB_PATH).with_suffix(".db-wal"))
-        db_main = NOTIFICATION_DB_PATH
         last_rec_id = self.last_rec_id
-        actions = self.actions
-        app_ids = self.app_identifiers
-        debounce_timer: list = [None]
-        lock = threading.Lock()
+        apps_desc = "、".join(self.app_identifiers) if self.app_identifiers else "所有 App"
+        logger.info("[DB 模式] 增量轮询启动，应用: %s", apps_desc)
+        logger.info("按 Ctrl+C 停止")
 
-        def _process():
-            nonlocal last_rec_id
+        while not stop_event.is_set():
             try:
                 notifs = fetch_new_notifications(
                     since_rec_id=last_rec_id,
-                    app_identifiers=app_ids if app_ids else None,
+                    app_identifiers=self.app_identifiers if self.app_identifiers else None,
                 )
                 for notif in notifs:
-                    for action in actions:
+                    for action in self.actions:
                         try:
                             action.execute(notif)
                         except Exception as e:
@@ -119,35 +114,8 @@ class DBListener:
                     save_state({"last_rec_id": last_rec_id})
             except Exception as e:
                 logger.error("DB 读取异常: %s", e)
+            stop_event.wait(self.polling_interval)
 
-        def _schedule():
-            with lock:
-                if debounce_timer[0]:
-                    debounce_timer[0].cancel()
-                timer = threading.Timer(self.DEBOUNCE_SECS, _process)
-                debounce_timer[0] = timer
-                timer.start()
-
-        class Handler(FileSystemEventHandler):
-            def on_modified(self, event):
-                if event.src_path in (db_main, db_wal):
-                    _schedule()
-
-            def on_created(self, event):
-                if event.src_path in (db_main, db_wal):
-                    _schedule()
-
-        observer = Observer()
-        observer.schedule(Handler(), path=db_dir, recursive=False)
-        observer.start()
-
-        apps_desc = "、".join(app_ids) if app_ids else "所有 App"
-        logger.info("[DB 模式] FSEvents 监听启动，应用: %s", apps_desc)
-        logger.info("按 Ctrl+C 停止")
-
-        stop_event.wait()
-        observer.stop()
-        observer.join()
         save_state({"last_rec_id": last_rec_id})
         logger.info("[DB 模式] 已停止，最后 rec_id=%d", last_rec_id)
 
@@ -318,7 +286,7 @@ def main():
     if mode == "auto":
         if can_access_notification_db():
             mode = "db"
-            logger.info("检测到通知数据库可访问 → 使用 DB 模式（FSEvents）")
+            logger.info("检测到通知数据库可访问 → 使用 DB 模式（增量轮询）")
         else:
             mode = "ax"
             logger.info("通知数据库不可访问 → 使用 AX 模式（Swift helper）")

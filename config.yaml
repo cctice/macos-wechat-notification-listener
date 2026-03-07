@@ -1,7 +1,9 @@
 # macOS 通知监听器配置
 
-# 轮询间隔（秒），推荐 2~5 秒
-polling_interval: 3
+# DB 模式轮询间隔（秒）
+# 只读取最新 rec_id 的增量记录，本机开销极低。
+# 推荐 0.3 ~ 1.0 秒之间。
+polling_interval: 0.5
 
 # 监听的 App Bundle ID 列表
 # 留空（apps: []）则监听所有 App 的通知

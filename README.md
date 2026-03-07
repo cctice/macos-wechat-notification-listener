@@ -8,10 +8,10 @@
 
 | macOS 版本 | 方案 | 原理 |
 |---|---|---|
-| ≤ 26.2 | **DB 模式**（默认） | FSEvents 监听通知数据库 WAL 文件，增量读取 SQLite |
-| 26.3+ | **AX 模式** | 原生 Swift helper 用 `AXObserver` 监听 `UserNotificationCenter` 窗口创建事件 |
+| 数据库可访问 | **DB 模式**（优先） | 轻量轮询 SQLite，仅按 `rec_id` 读取增量通知 |
+| 数据库不可访问 | **AX 模式** | 原生 Swift helper 用 `AXObserver` 监听 `UserNotificationCenter` 窗口创建事件 |
 
-两种方案均为**纯事件驱动**，进程平时处于睡眠状态，零 CPU / 零轮询。
+DB 模式虽然采用轮询，但只查询最新 `rec_id` 的增量记录，本机开销极低，不涉及任何 LLM token 消耗。
 
 ## 快速开始
 
@@ -24,7 +24,7 @@ python3 listener.py
 
 # 强制指定方案
 python3 listener.py --mode db   # 数据库方案
-python3 listener.py --mode ax   # Accessibility 方案（macOS 26.3+）
+python3 listener.py --mode ax   # Accessibility 方案（数据库不可用时）
 
 # 其他选项
 python3 listener.py --config my_config.yaml
@@ -42,7 +42,7 @@ python3 listener.py --debug
 ## 配置说明（config.yaml）
 
 ```yaml
-polling_interval: 3   # 轮询间隔（秒）
+polling_interval: 0.5   # DB 模式轮询间隔（秒）
 
 apps:
   - com.tencent.xinwechat   # 微信
@@ -112,7 +112,7 @@ actions:
 
 ## 注意事项
 
-- DB 模式使用 WAL 文件事件监听，以只读方式打开不会影响系统稳定性
+- DB 模式只读取 SQLite 增量记录，以只读方式打开不会影响系统稳定性
 - 进程重启后会从上次的 `rec_id` 继续（状态保存在 `.listener_state.json`）
 - 微信的通知内容可能因隐私设置而被截断（如显示"1条新消息"而非具体内容）
 - AX 模式不再依赖 `pyobjc + ctypes`，避免在 macOS 26.3 上触发 `SIGSEGV`
